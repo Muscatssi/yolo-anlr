@@ -66,20 +66,53 @@ for i, result in enumerate(results):
     for j, box in enumerate(xyxy):
         # 1: 탐지 영역 자르기
         x1, y1, x2, y2 = box
-        cropped_img = img[y1:y2, x1:x2]  # 이미지 자르기
+        pixel = 5
+        cropped_img = img[y1-pixel:y2+pixel, x1-pixel:x2+pixel]  # 이미지 자르기
         crop_path = f"cropped/crop_{j}_original.jpg"
         cv2.imwrite(crop_path, cropped_img)
 
         # 2: 4개의 꼭짓점 찾기
+        resized = cv2.resize(cropped_img, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
         crop_gray = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2GRAY)
-        crop_blur = cv2.GaussianBlur(crop_gray, (0,0), 3)
-        #sharpened = cv2.addWeighted(resized_plate, 1.5, crop_blur, -0.5, 0)
-        crop_canny = cv2.Canny(crop_blur, 100, 200)
+        crop_blur = cv2.GaussianBlur(crop_gray, (0, 0), 5)
+        #sharpened = cv2.addWeighted(crop_blur, 1.5, crop_blur, -0.5, 0)
+        #crop_canny = cv2.Canny(crop_blur, 30, 90)
+        _, crop_thred = cv2.threshold(crop_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1,1))
+        thin = cv2.erode(crop_thred, kernel, iterations=1)
 
-        contours, _ = cv2.findContours(crop_canny, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        #cv2.imwrite(f"cropped/canny_{j}.jpg", crop_canny)
+        cv2.imwrite(f"cropped/threshold_{j}.jpg", crop_thred)
+
+        #contours, _ = cv2.findContours(crop_canny, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(crop_thred, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours:
+            print(f"   - 경고({j+1}): Canny Edge에서 윤곽선을 찾지 못했습니다.")
+            continue
         contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
-        #_, binary_plate = cv2.threshold(resized_plate, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
+        contour_vis_img = cropped_img.copy()
+        cv2.drawContours(contour_vis_img, contours, -1, (0,255,0),2)
+        cv2.imwrite(f"cropped/contours_{j}.jpg", contour_vis_img) 
+
+        # 가장 큰 윤곽선을 번호판 후보로 선택
+        largest_contour = contours[0]
+        
+        # 1. 최소 면적 사각형 찾기
+        rect = cv2.minAreaRect(largest_contour)
+        
+        # 2. 사각형의 4개 꼭짓점 좌표 구하기
+        box = cv2.boxPoints(rect)
+        box = np.intp(box) # 정수형으로 변환
+
+        # 찾은 사각형(파란색)을 시각화 이미지에 그려서 확인
+        cv2.drawContours(contour_vis_img, [box], 0, (255, 0, 0), 2)
+        cv2.imwrite(f"cropped/crop_{j}_contours_and_box.jpg", contour_vis_img)
+        
+        plate_contour = box # plate_contour 변수에 꼭짓점 좌표 할당
+
+        """
         plate_contour = None
         for contour in contours:
             peri = cv2.arcLength(contour, True)
@@ -87,45 +120,43 @@ for i, result in enumerate(results):
             if len(approx) == 4:
                 plate_contour = approx
                 break
+        """
 
-        # 3: 꼭짓점 찾았다면 원근 변환, 못 찾았으면 원본이미지 사용
-        if plate_contour is not None:
-            points = plate_contour.reshape(4, 2)
-            src_pts = order_points(points)
+        # 3: 꼭짓점 기준 원근 변환
+        points = plate_contour.reshape(4, 2)
+        src_pts = order_points(points)
 
-            # 실제 번호판 비율로 조정 
-            PLATE_WIDTH = 220
-            PLATE_HEIGHT = 45
+        # 실제 번호판 비율로 조정 
+        PLATE_WIDTH = 220
+        PLATE_HEIGHT = 45
 
-            dst_pts = np.array([[0, 0], 
-                                [PLATE_WIDTH - 1, 0], 
-                                [PLATE_WIDTH - 1, PLATE_HEIGHT - 1], 
-                                [0, PLATE_HEIGHT - 1]], 
-                                dtype="float32")
-            
-            matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
-            # cropped_img 이미지에 대해 원근 변환을 적용합니다.
-            warped_plate = cv2.warpPerspective(cropped_img, matrix, (PLATE_WIDTH, PLATE_HEIGHT))
-            print(f"   - 번호판({j+1}) 원근 변환 성공!")
-            cv2.imwrite(f"cropped/crop_{j}_warped.jpg", warped_plate)
-            final_plate_for_ocr = warped_plate
-        else:
-            print(f"   - 경고({j+1}): 사각형을 찾지 못해 YOLO 영역을 그대로 사용합니다.")
-            final_plate_for_ocr = cropped_img # 원근 변환 실패 시 YOLO 크롭 이미지를 사용
-
+        dst_pts = np.array([[0, 0], 
+                            [PLATE_WIDTH - 1, 0], 
+                            [PLATE_WIDTH - 1, PLATE_HEIGHT - 1], 
+                            [0, PLATE_HEIGHT - 1]], 
+                            dtype="float32")
+        
+        matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
+        # cropped_img 이미지에 대해 원근 변환을 적용합니다.
+        warped_plate = cv2.warpPerspective(cropped_img, matrix, (PLATE_WIDTH, PLATE_HEIGHT))
+        print(f"   - 번호판({j}) 원근 변환 성공!")
+        cv2.imwrite(f"cropped/warped_{j}.jpg", warped_plate)
+        final_plate_for_ocr = warped_plate
+        
         # 4: OCR 인식
         gray_ocr = cv2.cvtColor(final_plate_for_ocr, cv2.COLOR_BGR2GRAY)
 
         # OCR 전처리
-        resized_ocr = cv2.resize(gray_ocr, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-        _, binary_plate = cv2.threshold(resized_ocr, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        resized_ocr = cv2.resize(gray_ocr, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+        _, binary_plate = cv2.threshold(resized_ocr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         
+        """
         # 노이즈 제거
         kernel = np.ones((1,1), np.uint8)
         binary_plate = cv2.morphologyEx(binary_plate, cv2.MORPH_OPEN, kernel)
         binary_plate = cv2.morphologyEx(binary_plate, cv2.MORPH_CLOSE, kernel)
-
-        cv2.imwrite(f"cropped/crop_{j}_binary_for_ocr.jpg", binary_plate)
+"""
+        cv2.imwrite(f"cropped/binary_for_ocr_{j}.jpg", binary_plate)
         
 
         # Pytesseract로 OCR 수행
